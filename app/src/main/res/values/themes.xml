@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Activityをダイアログとして表示するためのテーマ -->
+    <style name="Theme.Pdftoimg" parent="android:Theme.Material.Light.NoActionBar">
+        <!-- 必要に応じて通常のテーマ定義 -->
+    </style>
+
+    <!-- 透過ダイアログ用テーマ -->
+    <style name="Theme.Pdftoimg.Dialog" parent="Theme.Material3.DayNight.Dialog">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:backgroundDimEnabled">true</item>
+        <item name="android:backgroundDimAmount">0.5</item>
+        <!-- ダイアログのタイトルバーを消す -->
+        <item name="android:windowNoTitle">true</item>
+    </style>
+</resources>
