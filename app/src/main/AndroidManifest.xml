@@ -10,17 +10,12 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.Pdftoimg.Dialog">>
+        android:theme="@style/Theme.Pdftoimg.Dialog">
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"
-            android:theme="@style/Theme.Pdftoimg.Dialog">>
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
+            android:theme="@style/Theme.Pdftoimg.Dialog">
 
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
