@@ -1,5 +1,6 @@
 package com.atuy.pdftoimg
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -27,7 +28,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 共有インテントからURIを取得
         if (Intent.ACTION_SEND == intent.action && intent.type == "application/pdf") {
             val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
@@ -40,18 +40,15 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             PdftoimgTheme {
-                // ダイアログ風のUIを提供
-                // Activity自体が透明テーマなので、ここで背景を半透明にしたり、Cardを配置したりする
                 Surface(
                     modifier = Modifier.fillMaxSize(),
-                    color = Color.Transparent // 背景はテーマで制御済みだが念のため
+                    color = Color.Transparent
                 ) {
                     Box(
                         contentAlignment = Alignment.Center,
                         modifier = Modifier
                             .fillMaxSize()
                             .padding(16.dp)
-                        // 画面外タップで閉じる処理を入れたい場合はここにclickableを追加し、Cardのクリックイベントを消費させる
                     ) {
                         ConverterDialogContent(
                             viewModel = viewModel,
@@ -72,10 +69,10 @@ fun ConverterDialogContent(
     val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
 
-    // 完了時にToastを出して閉じる（オプション）
-    LaunchedEffect(uiState.isComplete) {
-        if (uiState.isComplete) {
+    LaunchedEffect(uiState.isSaveComplete) {
+        if (uiState.isSaveComplete) {
             Toast.makeText(context, uiState.statusMessage, Toast.LENGTH_LONG).show()
+            onClose()
         }
     }
 
@@ -113,7 +110,6 @@ fun ConverterDialogContent(
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // フォーマット選択
             Text(
                 text = "保存形式",
                 style = MaterialTheme.typography.labelLarge,
@@ -124,16 +120,14 @@ fun ConverterDialogContent(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
-                // よく使うフォーマットのみ表示、またはすべて表示
                 val displayFormats = ImageFormat.values()
-
 
                 displayFormats.forEach { format ->
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         RadioButton(
                             selected = (format == uiState.selectedFormat),
                             onClick = {
-                                if (!uiState.isConverting) {
+                                if (!uiState.isConverting && !uiState.isSaving) {
                                     viewModel.updateSelectedFormat(format)
                                 }
                             }
@@ -148,21 +142,24 @@ fun ConverterDialogContent(
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // ステータス表示
-            if (uiState.isConverting) {
+            if (uiState.isConverting || uiState.isSaving) {
                 LinearProgressIndicator(
-                    progress = { uiState.progress },
+                    progress = { 
+                        if(uiState.isSaving) 0f // 保存中は不確定プログレス（または別途計算）にする
+                        else uiState.progress 
+                    },
                     modifier = Modifier.fillMaxWidth()
                 )
-                Text(
-                    text = "${(uiState.progress * 100).toInt()}%",
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(top = 4.dp)
-                )
+                if (uiState.isConverting) {
+                    Text(
+                        text = "${(uiState.progress * 100).toInt()}%",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                }
             }
 
-            // エラーメッセージ等の表示（赤字などで強調）
-            if (uiState.statusMessage.isNotEmpty() && !uiState.isConverting) {
+            if (uiState.statusMessage.isNotEmpty() && !uiState.isConverting && !uiState.isSaving) {
                 Text(
                     text = uiState.statusMessage,
                     style = MaterialTheme.typography.bodyMedium,
@@ -180,19 +177,56 @@ fun ConverterDialogContent(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.End
             ) {
-                TextButton(onClick = onClose) {
-                    Text("閉じる")
-                }
+                if (uiState.isComplete) {
+                    // 変換完了後の表示（共有、保存）
+                    OutlinedButton(
+                        onClick = { shareImages(context, uiState.generatedImageUris) },
+                        enabled = !uiState.isSaving
+                    ) {
+                        Text("共有")
+                    }
 
-                Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
 
-                Button(
-                    onClick = { viewModel.convertPdf() },
-                    enabled = uiState.targetUri != null && !uiState.isConverting
-                ) {
-                    Text(if (uiState.isComplete) "再変換" else "保存")
+                    Button(
+                        onClick = { viewModel.saveImagesToGallery() },
+                        enabled = !uiState.isSaving
+                    ) {
+                        Text("保存")
+                    }
+                } else {
+                    // 変換前の表示（閉じる、変換）
+                    TextButton(onClick = onClose) {
+                        Text("閉じる")
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+
+                    Button(
+                        onClick = { viewModel.convertPdf() },
+                        enabled = uiState.targetUri != null && !uiState.isConverting
+                    ) {
+                        Text("変換")
+                    }
                 }
             }
         }
     }
+}
+
+fun shareImages(context: Context, uris: List<Uri>) {
+    if (uris.isEmpty()) return
+
+    val shareIntent = Intent().apply {
+        if (uris.size == 1) {
+            action = Intent.ACTION_SEND
+            putExtra(Intent.EXTRA_STREAM, uris.first())
+        } else {
+            action = Intent.ACTION_SEND_MULTIPLE
+            putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+        }
+        type = "image/*"
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(shareIntent, "画像を共有"))
 }

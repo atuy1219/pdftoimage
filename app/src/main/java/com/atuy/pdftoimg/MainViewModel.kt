@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
+import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -17,6 +18,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 
 enum class ImageFormat(val extension: String, val mimeType: String, val compressFormat: Bitmap.CompressFormat) {
     PNG("png", "image/png", Bitmap.CompressFormat.PNG),
@@ -35,24 +37,28 @@ class PdfConverterViewModel(application: Application) : AndroidViewModel(applica
     private val prefs = application.getSharedPreferences("pdf_converter_prefs", Application.MODE_PRIVATE)
     private val KEY_SELECTED_FORMAT = "key_selected_format"
 
-    // UI状態
     private val _uiState = MutableStateFlow(PdfConverterUiState())
     val uiState = _uiState.asStateFlow()
 
     init {
-        // 設定の読み込み
         val savedExt = prefs.getString(KEY_SELECTED_FORMAT, ImageFormat.PNG.extension)
         _uiState.value = _uiState.value.copy(selectedFormat = ImageFormat.fromExtension(savedExt))
     }
 
     fun updateSelectedFormat(format: ImageFormat) {
         _uiState.value = _uiState.value.copy(selectedFormat = format)
-        // 設定の保存
         prefs.edit().putString(KEY_SELECTED_FORMAT, format.extension).apply()
     }
 
     fun setTargetUri(uri: Uri?) {
-        _uiState.value = _uiState.value.copy(targetUri = uri, statusMessage = if(uri != null) "変換する準備ができました" else "ファイルが選択されていません")
+        _uiState.value = _uiState.value.copy(
+            targetUri = uri,
+            statusMessage = if(uri != null) "変換する準備ができました" else "ファイルが選択されていません",
+            isComplete = false,
+            isSaveComplete = false,
+            generatedImageUris = emptyList(),
+            generatedImageFiles = emptyList()
+        )
     }
 
     fun convertPdf() {
@@ -60,10 +66,16 @@ class PdfConverterViewModel(application: Application) : AndroidViewModel(applica
         val format = uiState.value.selectedFormat
 
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isConverting = true, progress = 0f, statusMessage = "変換中...")
+            _uiState.value = _uiState.value.copy(
+                isConverting = true,
+                progress = 0f,
+                statusMessage = "変換中...",
+                generatedImageUris = emptyList(),
+                generatedImageFiles = emptyList()
+            )
 
             try {
-                convertPdfToImages(uri, format)
+                convertPdfToTempFiles(uri, format)
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
                     isConverting = false,
@@ -73,11 +85,59 @@ class PdfConverterViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    private suspend fun convertPdfToImages(pdfUri: Uri, format: ImageFormat) {
+    fun saveImagesToGallery() {
+        val files = uiState.value.generatedImageFiles
+        val format = uiState.value.selectedFormat
+        
+        if (files.isEmpty()) return
+
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                isSaving = true,
+                statusMessage = "保存中..."
+            )
+
+            try {
+                withContext(Dispatchers.IO) {
+                    val context = getApplication<Application>()
+                    var successCount = 0
+                    
+                    files.forEach { file ->
+                        if (saveFileToGallery(context, file, format)) {
+                            successCount++
+                        }
+                    }
+
+                    withContext(Dispatchers.Main) {
+                        _uiState.value = _uiState.value.copy(
+                            isSaving = false,
+                            isSaveComplete = true,
+                            statusMessage = "${successCount}枚の画像を保存しました"
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    isSaving = false,
+                    statusMessage = "保存エラー: ${e.localizedMessage}"
+                )
+            }
+        }
+    }
+
+    private suspend fun convertPdfToTempFiles(pdfUri: Uri, format: ImageFormat) {
         withContext(Dispatchers.IO) {
             val context = getApplication<Application>()
             var fileDescriptor: ParcelFileDescriptor? = null
             var pdfRenderer: PdfRenderer? = null
+            val generatedUris = mutableListOf<Uri>()
+            val generatedFiles = mutableListOf<File>()
+
+            val cacheDir = File(context.cacheDir, "pdf_images")
+            if (cacheDir.exists()) {
+                cacheDir.deleteRecursively()
+            }
+            cacheDir.mkdirs()
 
             try {
                 fileDescriptor = context.contentResolver.openFileDescriptor(pdfUri, "r")
@@ -85,18 +145,14 @@ class PdfConverterViewModel(application: Application) : AndroidViewModel(applica
                     throw Exception("ファイルを開けませんでした")
                 }
 
-                // ここでSecurityExceptionが発生する可能性がある
                 pdfRenderer = PdfRenderer(fileDescriptor)
-
                 val pageCount = pdfRenderer.pageCount
 
                 for (i in 0 until pageCount) {
-                    if (!_uiState.value.isConverting) break // キャンセル処理用
+                    if (!_uiState.value.isConverting) break
 
                     val page = pdfRenderer.openPage(i)
 
-                    // メモリ対策: 解像度制限
-                    // 長辺が2048pxを超えないようにスケールを調整
                     val scale = calculateScale(page.width, page.height, 2048)
                     val width = (page.width * scale).toInt()
                     val height = (page.height * scale).toInt()
@@ -105,7 +161,21 @@ class PdfConverterViewModel(application: Application) : AndroidViewModel(applica
                     bitmap.eraseColor(android.graphics.Color.WHITE)
                     page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
 
-                    saveBitmapToGallery(context, bitmap, "page_${i + 1}", format)
+                    val fileName = "temp_page_${i + 1}.${format.extension}"
+                    val file = File(cacheDir, fileName)
+                    
+                    FileOutputStream(file).use { out ->
+                        bitmap.compress(format.compressFormat, 100, out)
+                    }
+
+                    val uri = FileProvider.getUriForFile(
+                        context,
+                        "${context.packageName}.fileprovider",
+                        file
+                    )
+
+                    generatedFiles.add(file)
+                    generatedUris.add(uri)
 
                     page.close()
                     bitmap.recycle()
@@ -118,8 +188,10 @@ class PdfConverterViewModel(application: Application) : AndroidViewModel(applica
                 withContext(Dispatchers.Main) {
                     _uiState.value = _uiState.value.copy(
                         isConverting = false,
-                        statusMessage = "完了: ${pageCount}枚保存しました",
-                        isComplete = true
+                        statusMessage = "変換完了: ${pageCount}枚",
+                        isComplete = true,
+                        generatedImageUris = generatedUris,
+                        generatedImageFiles = generatedFiles
                     )
                 }
 
@@ -150,17 +222,16 @@ class PdfConverterViewModel(application: Application) : AndroidViewModel(applica
         return if (maxSide > maxDimension) {
             maxDimension.toFloat() / maxSide
         } else {
-            2.0f // 元画像のサイズが小さければ2倍にする（高解像度化）
+            2.0f
         }
     }
 
-    private fun saveBitmapToGallery(
+    private fun saveFileToGallery(
         context: Application,
-        bitmap: Bitmap,
-        baseFileName: String,
+        sourceFile: File,
         format: ImageFormat
-    ) {
-        val filename = "PDF_${System.currentTimeMillis()}_$baseFileName.${format.extension}"
+    ): Boolean {
+        val filename = "PDF_${System.currentTimeMillis()}_${sourceFile.name}"
 
         val contentValues = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, filename)
@@ -172,16 +243,22 @@ class PdfConverterViewModel(application: Application) : AndroidViewModel(applica
         val resolver = context.contentResolver
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
 
-        uri?.let {
-            resolver.openOutputStream(it).use { outputStream ->
-                if (outputStream != null) {
-                    bitmap.compress(format.compressFormat, 100, outputStream)
+        return uri?.let { targetUri ->
+            try {
+                resolver.openOutputStream(targetUri).use { outputStream ->
+                    sourceFile.inputStream().use { inputStream ->
+                        inputStream.copyTo(outputStream!!)
+                    }
                 }
+                contentValues.clear()
+                contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
+                resolver.update(targetUri, contentValues, null, null)
+                true
+            } catch (e: Exception) {
+                e.printStackTrace()
+                false
             }
-            contentValues.clear()
-            contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
-            resolver.update(it, contentValues, null, null)
-        }
+        } ?: false
     }
 }
 
@@ -189,7 +266,11 @@ data class PdfConverterUiState(
     val targetUri: Uri? = null,
     val selectedFormat: ImageFormat = ImageFormat.PNG,
     val isConverting: Boolean = false,
+    val isSaving: Boolean = false,
     val progress: Float = 0f,
     val statusMessage: String = "ファイルを選択してください",
-    val isComplete: Boolean = false
+    val isComplete: Boolean = false,
+    val isSaveComplete: Boolean = false,
+    val generatedImageUris: List<Uri> = emptyList(),
+    val generatedImageFiles: List<File> = emptyList()
 )
